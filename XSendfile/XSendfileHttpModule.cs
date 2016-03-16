@@ -3,6 +3,7 @@ using System.Linq;
 using System.Web;
 using System.Configuration;
 using System.IO;
+using System.Text.RegularExpressions;
 
 //
 // This feels hacky
@@ -32,14 +33,15 @@ namespace XSendFile
             //
             // Determine the file path and ready the response
             //
-            if (ConfigurationManager.AppSettings["XSendDir"] != null)
-                filePath = Path.Combine(ConfigurationManager.AppSettings["XSendDir"], filePath);    // if there is a base path set (file will be located above this)
-            else if (ConfigurationManager.AppSettings["XAccelLocation"] != null)
-                filePath = filePath.Replace(ConfigurationManager.AppSettings["XAccelLocation"], ConfigurationManager.AppSettings["XAccelRoot"]);
+            //if (ConfigurationManager.AppSettings["XSendDir"] != null)
+            //    filePath = Path.Combine(ConfigurationManager.AppSettings["XSendDir"], filePath);    // if there is a base path set (file will be located above this)
+            //else if (ConfigurationManager.AppSettings["XAccelLocation"] != null)
+            //    filePath = filePath.Replace(ConfigurationManager.AppSettings["XAccelLocation"], ConfigurationManager.AppSettings["XAccelRoot"]);
 
             response.Clear();                               // Clears output buffer
             response.Headers.Remove("X-Sendfile");          // Remove unwanted headers
             response.Headers.Remove("X-Accel-Redirect");
+            filePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, filePath);
 
             //
             // Set the cache policy
@@ -62,22 +64,25 @@ namespace XSendFile
             // Get the file information and set headers appropriately
             //
             var file = new FileInfo(filePath);
+
             if (!file.Exists)
             {
-                throw new HttpException(404, "File_does_not_exist");
+                RedirectOnNotFound(HttpContext.Current);
+                return;
             }
 
             if (filePath[filePath.Length - 1] == '.')
             {
-                throw new HttpException(404, "File_does_not_exist");
+                RedirectOnNotFound(HttpContext.Current);
+                return;
             }
-
 
             response.Cache.SetLastModified(file.LastWriteTimeUtc);
             response.Headers.Remove("Content-Length");
+            response.Headers.Remove("X-E107-Redirect-To");
 
-
-            if (!string.IsNullOrEmpty(request.ServerVariables["HTTP_RANGE"]))
+            var rex = new Regex(@"^bytes=\d*-\d*(,\d*-\d*)*$");
+            if (!string.IsNullOrEmpty(request.ServerVariables["HTTP_RANGE"]) && rex.IsMatch(request.ServerVariables["HTTP_RANGE"]))
             {
                 //request for chunk
                 RangeDownload(file.FullName, HttpContext.Current);
@@ -86,7 +91,6 @@ namespace XSendFile
             {
                 response.AddHeader("Content-Length", file.Length.ToString());
                 response.AppendHeader("Accept-Ranges", "bytes");
-
 
                 //
                 // Check if we want to detect the mime type of the current content
@@ -105,13 +109,11 @@ namespace XSendFile
                     response.ContentType = mt != null ? mt.GetAttributeValue("mimeType").ToString() : "application/octet-stream";
                 }
 
-
                 //
                 // Set a content disposition if it is not already set by the application
                 //
                 if (response.Headers["Content-Disposition"] == null)
-                    response.AppendHeader("Content-Disposition", "inline;filename=" + file.Name);
-
+                    response.AppendHeader("Content-Disposition", string.Format("attachment;filename=\"{0}\"", file.Name));
 
                 //
                 //  Send the file without loading it into memory
@@ -121,6 +123,21 @@ namespace XSendFile
         }
 
         public void Dispose() { }
+
+        private static void RedirectOnNotFound(HttpContext context)
+        {
+            var response = context.Response;
+            var redirectTo = response.Headers.Get("X-E107-Redirect-To");
+            if (redirectTo != null)
+            {
+                response.Headers.Remove("X-E107-Redirect-To");
+                response.Redirect(redirectTo);
+            }
+            else
+            {
+                throw new HttpException(404, "File_does_not_exist");
+            }
+        }
 
         //
         // http://blogs.visigo.com/chriscoulson/easy-handling-of-http-range-requests-in-asp-net/
@@ -148,6 +165,14 @@ namespace XSendFile
                  * as well as a boundry header to indicate the various chunks of data.
                  */
                 context.Response.AddHeader("Accept-Ranges", "0-" + size);
+
+                var rex = new Regex(@"^bytes=\d*-\d*(,\d*-\d*)*$");
+                if (!rex.IsMatch(context.Request.ServerVariables["HTTP_RANGE"]))
+                {
+                    context.Response.AddHeader("Content-Range", string.Format("bytes {0}-{1}/{2}", start, end, size));
+                    throw new HttpException(416, "Requested Range Not Satisfiable");
+                }
+
                 // header('Accept-Ranges: bytes');
                 // multipart/byteranges
                 // http://www.w3.org/Protocols/rfc2616/rfc2616-sec19.html#sec19.2         
@@ -159,10 +184,7 @@ namespace XSendFile
                 // Make sure the client hasn't sent us a multibyte range
                 if (range.IndexOf(",", StringComparison.Ordinal) > -1)
                 {
-                    // (?) Shoud this be issued here, or should the first
-                    // range be used? Or should the header be ignored and
-                    // we output the whole content?
-                    context.Response.AddHeader("Content-Range", "bytes " + start + "-" + end + "/" + size);
+                    context.Response.AddHeader("Content-Range", string.Format("bytes {0}-{1}/{2}", start, end, size));
                     throw new HttpException(416, "Requested Range Not Satisfiable");
                 }
 
@@ -179,7 +201,7 @@ namespace XSendFile
                     arrSplit = range.Split(new char[] { Convert.ToChar("-") });
                     anotherStart = Convert.ToInt64(arrSplit[0]);
                     long temp = 0;
-                    anotherEnd = (arrSplit.Length > 1 && Int64.TryParse(arrSplit[1].ToString(), out temp)) ? Convert.ToInt64(arrSplit[1]) : size;
+                    anotherEnd = (arrSplit.Length > 1 && long.TryParse(arrSplit[1], out temp)) ? Convert.ToInt64(arrSplit[1]) : size;
                 }
                 /* Check the range and make sure it's treated according to the specs.
                  * http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html
@@ -189,8 +211,7 @@ namespace XSendFile
                 // Validate the requested range and return an error if it's not correct.
                 if (anotherStart > anotherEnd || anotherStart > size - 1 || anotherEnd >= size)
                 {
-
-                    context.Response.AddHeader("Content-Range", "bytes " + start + "-" + end + "/" + size);
+                    context.Response.AddHeader("Content-Range", string.Format("bytes {0}-{1}/{2}", start, end, size));
                     throw new HttpException(416, "Requested Range Not Satisfiable");
                 }
                 start = anotherStart;
@@ -200,8 +221,9 @@ namespace XSendFile
                 fp = reader.BaseStream.Seek(start, SeekOrigin.Begin);
                 context.Response.StatusCode = 206;
             }
+
             // Notify the client the byte range we'll be outputting
-            context.Response.AddHeader("Content-Range", "bytes " + start + "-" + end + "/" + size);
+            context.Response.AddHeader("Content-Range", string.Format("bytes {0}-{1}/{2}", start, end, size));
             context.Response.AddHeader("Content-Length", length.ToString());
             // Start buffered download
 
